@@ -728,3 +728,470 @@ Clarinet.test({
     },
 });
 
+// CONTRACT ADMINISTRATION AND EDGE CASES TESTS
+
+Clarinet.test({
+    name: "Contract owner successfully updates platform fee",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const contractOwner = accounts.get("deployer")!; // Contract owner is typically the deployer
+        
+        let block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "update-platform-fee",
+                [types.uint(10)], // Set to 10%
+                contractOwner.address
+            )
+        ]);
+        
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result.expectOk(), "true");
+        
+        // Test platform fee calculation
+        let feeCalculation = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "calculate-platform-fee",
+            [types.uint(1000000)], // 1 STX
+            contractOwner.address
+        );
+        
+        assertEquals(feeCalculation.result, types.uint(100000)); // 10% of 1 STX
+    },
+});
+
+Clarinet.test({
+    name: "Prevents non-owner from updating platform fee",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const unauthorized = accounts.get("wallet_1")!;
+        
+        let block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "update-platform-fee",
+                [types.uint(15)],
+                unauthorized.address
+            )
+        ]);
+        
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result.expectErr(), types.uint(1)); // ERR-NOT-AUTHORIZED
+    },
+});
+
+Clarinet.test({
+    name: "Prevents setting platform fee above 100%",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const contractOwner = accounts.get("deployer")!;
+        
+        let block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "update-platform-fee",
+                [types.uint(101)], // Above 100%
+                contractOwner.address
+            )
+        ]);
+        
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result.expectErr(), types.uint(5)); // ERR-INVALID-PRICE
+    },
+});
+
+Clarinet.test({
+    name: "Contract owner successfully updates minimum ticket price",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const contractOwner = accounts.get("deployer")!;
+        const organizer = accounts.get("wallet_1")!;
+        
+        // Update minimum ticket price
+        let block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "update-min-ticket-price",
+                [types.uint(5000000)], // 5 STX minimum
+                contractOwner.address
+            )
+        ]);
+        
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result.expectOk(), "true");
+        
+        // Try to create event with price below new minimum (should fail)
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-event",
+                [
+                    types.utf8("Cheap Event"),
+                    types.utf8("Event below new minimum"),
+                    types.utf8("Budget Venue"),
+                    types.uint(FUTURE_BLOCK),
+                    types.uint(100),
+                    types.uint(2000000), // 2 STX (below new minimum)
+                    types.uint(1000),
+                    types.utf8("Budget")
+                ],
+                organizer.address
+            )
+        ]);
+        
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result.expectErr(), types.uint(5)); // ERR-INVALID-PRICE
+    },
+});
+
+Clarinet.test({
+    name: "Prevents non-owner from updating minimum ticket price",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const unauthorized = accounts.get("wallet_1")!;
+        
+        let block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "update-min-ticket-price",
+                [types.uint(2000000)],
+                unauthorized.address
+            )
+        ]);
+        
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result.expectErr(), types.uint(1)); // ERR-NOT-AUTHORIZED
+    },
+});
+
+Clarinet.test({
+    name: "Prevents refund after refund window expires",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const organizer = accounts.get("wallet_1")!;
+        const buyer = accounts.get("wallet_2")!;
+        
+        // Create event with short refund window
+        let block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-event",
+                [
+                    types.utf8("Quick Event"),
+                    types.utf8("Event with short refund window"),
+                    types.utf8("Time-sensitive Venue"),
+                    types.uint(FUTURE_BLOCK),
+                    types.uint(100),
+                    types.uint(MIN_TICKET_PRICE),
+                    types.uint(2), // Very short refund window (2 blocks)
+                    types.utf8("Urgent")
+                ],
+                organizer.address
+            )
+        ]);
+        
+        // Purchase ticket
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "purchase-ticket",
+                [types.uint(1)],
+                buyer.address
+            )
+        ]);
+        
+        // Mine blocks to exceed refund window
+        chain.mineEmptyBlock();
+        chain.mineEmptyBlock();
+        chain.mineEmptyBlock(); // Now beyond refund window
+        
+        // Try to refund (should fail)
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "refund-ticket",
+                [types.uint(1)],
+                buyer.address
+            )
+        ]);
+        
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result.expectErr(), types.uint(11)); // ERR-REFUND-WINDOW-CLOSED
+    },
+});
+
+Clarinet.test({
+    name: "Prevents refund of already used tickets",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const organizer = accounts.get("wallet_1")!;
+        const buyer = accounts.get("wallet_2")!;
+        
+        // Create event, purchase and validate ticket
+        let block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-event",
+                [
+                    types.utf8("No Refund Event"),
+                    types.utf8("Event with used tickets"),
+                    types.utf8("Final Venue"),
+                    types.uint(FUTURE_BLOCK),
+                    types.uint(100),
+                    types.uint(MIN_TICKET_PRICE),
+                    types.uint(1000),
+                    types.utf8("Final")
+                ],
+                organizer.address
+            )
+        ]);
+        
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "purchase-ticket",
+                [types.uint(1)],
+                buyer.address
+            )
+        ]);
+        
+        // Validate ticket first
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "validate-ticket",
+                [types.uint(1)],
+                organizer.address
+            )
+        ]);
+        
+        // Try to refund used ticket (should fail)
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "refund-ticket",
+                [types.uint(1)],
+                buyer.address
+            )
+        ]);
+        
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result.expectErr(), types.uint(10)); // ERR-TICKET-USED
+    },
+});
+
+Clarinet.test({
+    name: "Prevents validation of refunded tickets",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const organizer = accounts.get("wallet_1")!;
+        const buyer = accounts.get("wallet_2")!;
+        
+        // Create event, purchase and refund ticket
+        let block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-event",
+                [
+                    types.utf8("Refunded Event"),
+                    types.utf8("Event with refunded tickets"),
+                    types.utf8("Flexible Venue"),
+                    types.uint(FUTURE_BLOCK),
+                    types.uint(100),
+                    types.uint(MIN_TICKET_PRICE),
+                    types.uint(1000),
+                    types.utf8("Flexible")
+                ],
+                organizer.address
+            )
+        ]);
+        
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "purchase-ticket",
+                [types.uint(1)],
+                buyer.address
+            )
+        ]);
+        
+        // Refund ticket first
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "refund-ticket",
+                [types.uint(1)],
+                buyer.address
+            )
+        ]);
+        
+        // Try to validate refunded ticket (should fail)
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "validate-ticket",
+                [types.uint(1)],
+                organizer.address
+            )
+        ]);
+        
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result.expectErr(), types.uint(10)); // ERR-TICKET-USED
+    },
+});
+
+Clarinet.test({
+    name: "Handles multiple ticket purchases and complex operations",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const organizer = accounts.get("wallet_1")!;
+        const buyer1 = accounts.get("wallet_2")!;
+        const buyer2 = accounts.get("wallet_3")!;
+        const buyer3 = accounts.get("wallet_4")!;
+        
+        // Create event with moderate capacity
+        let block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-event",
+                [
+                    types.utf8("Complex Event"),
+                    types.utf8("Event for complex operations testing"),
+                    types.utf8("Multi-purpose Venue"),
+                    types.uint(FUTURE_BLOCK),
+                    types.uint(10),
+                    types.uint(2000000), // 2 STX
+                    types.uint(500),
+                    types.utf8("Complex")
+                ],
+                organizer.address
+            )
+        ]);
+        
+        // Multiple ticket purchases
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "purchase-ticket", [types.uint(1)], buyer1.address),
+            Tx.contractCall(CONTRACT_NAME, "purchase-ticket", [types.uint(1)], buyer2.address),
+            Tx.contractCall(CONTRACT_NAME, "purchase-ticket", [types.uint(1)], buyer3.address),
+            Tx.contractCall(CONTRACT_NAME, "purchase-ticket", [types.uint(1)], buyer1.address), // Second ticket for buyer1
+        ]);
+        
+        assertEquals(block.receipts.length, 4);
+        block.receipts.forEach(receipt => {
+            assertEquals(receipt.result.expectOk(), "true");
+        });
+        
+        // Mixed operations: validate some, refund others
+        block = chain.mineBlock([
+            Tx.contractCall(CONTRACT_NAME, "validate-ticket", [types.uint(1)], organizer.address), // Validate buyer1's first ticket
+            Tx.contractCall(CONTRACT_NAME, "refund-ticket", [types.uint(2)], buyer2.address), // Refund buyer2's ticket
+            Tx.contractCall(CONTRACT_NAME, "validate-ticket", [types.uint(3)], organizer.address), // Validate buyer3's ticket
+        ]);
+        
+        assertEquals(block.receipts.length, 3);
+        assertEquals(block.receipts[0].result.expectOk(), "true"); // Validation success
+        assertEquals(block.receipts[1].result.expectOk(), "true"); // Refund success
+        assertEquals(block.receipts[2].result.expectOk(), "true"); // Validation success
+        
+        // Check final event state
+        let eventInfo = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-event",
+            [types.uint(1)],
+            organizer.address
+        );
+        
+        const eventData = eventInfo.result.expectSome().expectTuple();
+        assertEquals(eventData["tickets-sold"], types.uint(4)); // 4 tickets were sold
+        assertEquals(eventData["revenue"], types.uint(6000000)); // 3 tickets remaining after 1 refund (3 * 2 STX)
+        
+        // Check individual ticket states
+        let ticket1 = chain.callReadOnlyFn(CONTRACT_NAME, "get-ticket", [types.uint(1)], buyer1.address);
+        let ticket2 = chain.callReadOnlyFn(CONTRACT_NAME, "get-ticket", [types.uint(2)], buyer2.address);
+        let ticket4 = chain.callReadOnlyFn(CONTRACT_NAME, "get-ticket", [types.uint(4)], buyer1.address);
+        
+        assertEquals(ticket1.result.expectSome().expectTuple()["is-used"], types.bool(true));
+        assertEquals(ticket2.result.expectSome().expectTuple()["is-refunded"], types.bool(true));
+        assertEquals(ticket4.result.expectSome().expectTuple()["is-used"], types.bool(false)); // Still valid
+    },
+});
+
+Clarinet.test({
+    name: "Handles edge case of ticket operations on non-existent tickets",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const organizer = accounts.get("wallet_1")!;
+        const buyer = accounts.get("wallet_2")!;
+        
+        // Try to validate non-existent ticket
+        let block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "validate-ticket",
+                [types.uint(999)], // Non-existent ticket
+                organizer.address
+            )
+        ]);
+        
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result.expectErr(), types.uint(4)); // ERR-TICKET-NOT-FOUND
+        
+        // Try to refund non-existent ticket
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "refund-ticket",
+                [types.uint(999)], // Non-existent ticket
+                buyer.address
+            )
+        ]);
+        
+        assertEquals(block.receipts.length, 1);
+        assertEquals(block.receipts[0].result.expectErr(), types.uint(4)); // ERR-TICKET-NOT-FOUND
+        
+        // Try to get non-existent ticket info
+        let ticketInfo = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-ticket",
+            [types.uint(999)],
+            buyer.address
+        );
+        
+        assertEquals(ticketInfo.result, types.none());
+    },
+});
+
+Clarinet.test({
+    name: "Verifies read-only functions return correct data",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const organizer = accounts.get("wallet_1")!;
+        const buyer = accounts.get("wallet_2")!;
+        
+        // Test get-event for non-existent event
+        let eventInfo = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-event",
+            [types.uint(999)],
+            organizer.address
+        );
+        assertEquals(eventInfo.result, types.none());
+        
+        // Test get-user-tickets for user with no tickets
+        let userTickets = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-user-tickets",
+            [buyer.address],
+            buyer.address
+        );
+        assertEquals(userTickets.result, types.none());
+        
+        // Test get-organizer-revenue for organizer with no events
+        let organizerRevenue = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-organizer-revenue",
+            [buyer.address],
+            buyer.address
+        );
+        assertEquals(organizerRevenue.result, types.none());
+        
+        // Test calculate-platform-fee with default 5%
+        let feeCalculation = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "calculate-platform-fee",
+            [types.uint(1000000)], // 1 STX
+            organizer.address
+        );
+        assertEquals(feeCalculation.result, types.uint(50000)); // 5% of 1 STX
+    },
+});
+
